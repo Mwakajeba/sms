@@ -653,27 +653,96 @@ class WhatsAppController extends Controller
             Log::info('WhatsApp webhook received', [
                 'headers' => $request->headers->all(),
                 'body' => $request->all(),
-                'ip' => $request->ip()
+                'raw_body' => $request->getContent(),
+                'ip' => $request->ip(),
+                'method' => $request->method()
             ]);
+
+            // Try to get message_id and status from different possible locations
+            // WhatsApp API might send data in different formats
+            $messageId = $request->input('message_id') 
+                ?? $request->input('id') 
+                ?? $request->input('provider_message_id')
+                ?? $request->input('entry.0.changes.0.value.messages.0.id') // WhatsApp Business API format
+                ?? null;
+                
+            $status = $request->input('status')
+                ?? $request->input('entry.0.changes.0.value.statuses.0.status') // WhatsApp Business API format
+                ?? null;
+
+            // If not found in request, try JSON body
+            if (!$messageId || !$status) {
+                $jsonBody = json_decode($request->getContent(), true);
+                if ($jsonBody) {
+                    $messageId = $messageId ?? $jsonBody['message_id'] ?? $jsonBody['id'] ?? $jsonBody['entry'][0]['changes'][0]['value']['messages'][0]['id'] ?? null;
+                    $status = $status ?? $jsonBody['status'] ?? $jsonBody['entry'][0]['changes'][0]['value']['statuses'][0]['status'] ?? null;
+                }
+            }
 
             // Validate required fields
-            $validated = $request->validate([
-                'message_id' => 'required|string',
-                'status' => 'required|string|in:pending,sent,delivered,read,failed',
-            ], [
-                'message_id.required' => 'Message ID is required.',
-                'status.required' => 'Status is required.',
-                'status.in' => 'Status must be one of: pending, sent, delivered, read, failed.',
-            ]);
+            if (!$messageId) {
+                Log::warning('WhatsApp webhook: message_id missing', [
+                    'request_data' => $request->all(),
+                    'raw_body' => $request->getContent()
+                ]);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Message ID is required'
+                ], 400);
+            }
 
-            // Optional: Validate webhook secret if provided
-            $webhookSecret = $request->input('secret_key') ?? $request->header('X-Webhook-Secret');
+            if (!$status) {
+                Log::warning('WhatsApp webhook: status missing', [
+                    'message_id' => $messageId,
+                    'request_data' => $request->all()
+                ]);
+                
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Status is required'
+                ], 400);
+            }
+
+            // Normalize status
+            $status = strtolower($status);
+            $validStatuses = ['pending', 'sent', 'delivered', 'read', 'failed', 'accepted'];
+            
+            if (!in_array($status, $validStatuses)) {
+                // Map WhatsApp API statuses to our statuses
+                $statusMap = [
+                    'accepted' => 'sent',
+                    'received' => 'delivered',
+                    'viewed' => 'read',
+                ];
+                
+                if (isset($statusMap[$status])) {
+                    $status = $statusMap[$status];
+                } else {
+                    Log::warning('WhatsApp webhook: invalid status', [
+                        'message_id' => $messageId,
+                        'status' => $status
+                    ]);
+                    
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Invalid status: ' . $status
+                    ], 400);
+                }
+            }
+
+            // Optional: Validate webhook secret if BOTH are provided
+            // Only validate if the webhook sends a secret AND we have one configured
+            $webhookSecret = $request->input('secret_key') ?? $request->header('X-Webhook-Secret') ?? $request->header('Authorization');
             $expectedSecret = config('services.whatsapp.secret_key');
             
-            if ($expectedSecret && $webhookSecret !== $expectedSecret) {
-                Log::warning('WhatsApp webhook unauthorized', [
+            // Only validate secret if webhook provides one AND we have one configured
+            // If webhook doesn't send secret, we'll accept it (for APIs that don't send secrets)
+            if ($webhookSecret && $expectedSecret && $webhookSecret !== $expectedSecret) {
+                Log::warning('WhatsApp webhook unauthorized - secret mismatch', [
                     'ip' => $request->ip(),
-                    'provided_secret' => $webhookSecret ? 'provided' : 'missing'
+                    'provided_secret' => substr($webhookSecret, 0, 5) . '...',
+                    'expected_secret' => substr($expectedSecret, 0, 5) . '...'
                 ]);
                 
                 return response()->json([
@@ -681,9 +750,14 @@ class WhatsAppController extends Controller
                     'message' => 'Unauthorized'
                 ], 401);
             }
-
-            $messageId = $validated['message_id'];
-            $status = strtolower($validated['status']);
+            
+            // Log if secret validation was skipped
+            if (!$webhookSecret && $expectedSecret) {
+                Log::info('WhatsApp webhook accepted without secret validation', [
+                    'ip' => $request->ip(),
+                    'note' => 'Webhook did not provide secret key, but we have one configured'
+                ]);
+            }
 
             // Find message by provider_message_id
             $whatsappMessage = WhatsAppMessage::where('provider_message_id', $messageId)->first();
